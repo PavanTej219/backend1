@@ -10,20 +10,16 @@ python-dotenv
 # HTTP Requests
 requests
 
-# Groq API
-groq
+# Google Generative AI
+google-generativeai
 
 # Vector Database - Qdrant
 qdrant-client
 
 # LlamaIndex Core
 llama-index-core
-llama-index-llms-groq
+llama-index-llms-gemini
 llama-index-vector-stores-qdrant
-llama-index-embeddings-huggingface
-
-# Reranking
-sentence-transformers
 
 # Web Scraping
 beautifulsoup4
@@ -31,3 +27,8 @@ lxml
 
 # Numerical Computing
 numpy
+matplotlib
+
+# PDF Processing
+PyPDF2
+PyMuPDF
