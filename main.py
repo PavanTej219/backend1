@@ -1,7 +1,4 @@
-"""
-MediExtract FastAPI Backend with Google Cloud Vision API and OpenRouter Embeddings
-Medical Report Processing, RAG System, and Doctor Consultation
-"""
+
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +18,10 @@ import matplotlib.pyplot as plt
 import io
 import PyPDF2
 import fitz
+import random
+import string
+import uuid
+from pathlib import Path
 
 load_dotenv()
 
@@ -29,7 +30,7 @@ import requests as http_requests
 
 # Core imports
 import qdrant_client
-import google.generativeai as genai
+from groq import Groq
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
 # LlamaIndex imports
@@ -39,6 +40,7 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.settings import Settings
+from llama_index.llms.groq import Groq as GroqLLM
 from llama_index.llms.gemini import Gemini as GeminiLLM
 from llama_index.core.embeddings import BaseEmbedding
 
@@ -56,10 +58,11 @@ logger = logging.getLogger(__name__)
 # ================================
 
 class Config:
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # ADD THIS
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     QDRANT_URL = os.getenv("QDRANT_URL")
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-    GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY")
+    AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY")
+    AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT")  # e.g. https://<your-resource>.cognitiveservices.azure.com
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
     GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
     COLLECTION_NAME = "medical_reports_db"
@@ -82,14 +85,16 @@ class Config:
     @classmethod
     def validate(cls):
         missing = []
-        if not cls.GEMINI_API_KEY:  # CHANGE THIS
-            missing.append("GEMINI_API_KEY")
+        if not cls.GROQ_API_KEY:
+            missing.append("GROQ_API_KEY")
         if not cls.QDRANT_URL:
             missing.append("QDRANT_URL")
         if not cls.QDRANT_API_KEY:
             missing.append("QDRANT_API_KEY")
-        if not cls.GOOGLE_VISION_API_KEY:
-            missing.append("GOOGLE_VISION_API_KEY")
+        if not cls.AZURE_VISION_KEY:
+            missing.append("AZURE_VISION_KEY")
+        if not cls.AZURE_VISION_ENDPOINT:
+            missing.append("AZURE_VISION_ENDPOINT")
         if not cls.OPENROUTER_API_KEY:
             missing.append("OPENROUTER_API_KEY")
         if not cls.GOOGLE_MAPS_API_KEY:
@@ -289,8 +294,62 @@ class ComparisonResponse(BaseModel):
     comparison_table: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
-# ================================
-# DOCTOR FINDER
+# ── Video signaling models ──────────────────────────────────────────────────
+
+class VideoRoomCreate(BaseModel):
+    role: str  # 'doctor' | 'patient'
+
+class VideoSignalPayload(BaseModel):
+    type: str             # 'offer' | 'answer' | 'candidate'
+    data: Dict[str, Any]
+    sender: str           # 'doctor' | 'patient'
+
+class VideoRoomResponse(BaseModel):
+    success: bool
+    room_id: Optional[str] = None
+    message: Optional[str] = None
+
+# =============================================================================
+# IN-MEMORY VIDEO ROOM STORE
+# =============================================================================
+
+# Room structure (v5.1):
+# {
+#   "created":            ISO timestamp string,
+#   "doctor_joined":      bool,
+#   "patient_joined":     bool,
+#   "offer":              dict or None,
+#   "answer":             dict or None,
+#   "doctor_candidates":  [],
+#   "patient_candidates": [],
+#   "last_activity":      ISO timestamp string,
+#   "call_ended":         bool          ← NEW in v5.1
+# }
+
+video_rooms: Dict[str, Dict[str, Any]] = {}
+# Stores shared files: { file_id: { filename, content_type, data (bytes), uploaded_by, room_id, timestamp } }
+shared_files: Dict[str, Dict[str, Any]] = {}
+
+
+def _gen_room_id() -> str:
+    """Generate a unique 6-character uppercase room ID."""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+
+def _cleanup_old_rooms():
+    """Remove rooms older than 2 hours."""
+    cutoff = datetime.now().timestamp() - 7200
+    to_delete = [
+        rid for rid, room in video_rooms.items()
+        if datetime.fromisoformat(room['created']).timestamp() < cutoff
+    ]
+    for rid in to_delete:
+        del video_rooms[rid]
+    if to_delete:
+        logger.info(f"Cleaned up {len(to_delete)} expired video rooms")
+
+# =============================================================================
+ #DOCTOR FINDER
 # ================================
 
 """
@@ -675,56 +734,32 @@ class DoctorFinder:
         """Generate realistic doctor profiles using AI"""
         doctors = []
         try:
-            gemini_api_key = Config.GEMINI_API_KEY
-            gemini_api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+            groq_client = Groq(api_key=Config.GROQ_API_KEY)
             
-            prompt = f"""You generate realistic Indian doctor profiles in JSON format.
-
-Generate 5 realistic doctor names for {specialty} specialists in {city}, {state}, India.
+            prompt = f"""Generate 5 realistic doctor names for {specialty} specialists in {city}, {state}, India.
 Return ONLY valid JSON array with this exact format:
 [
   {{
     "name": "Dr. [First Last]",
     "hospital": "[Hospital Name], {city}",
-    "experience": "5 - 10 years",
+    "experience": "15 years",
     "rating": "4.5/5"
   }}
 ]
 
-Use common Indian doctor names. Keep hospital names realistic. Return only JSON, no markdown formatting."""
+Use common Indian doctor names. Keep hospital names realistic."""
 
-            # Use REST API
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.7,
-                    "maxOutputTokens": 1024,
-                }
-            }
-            
-            response = http_requests.post(
-                gemini_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
+            response = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You generate realistic Indian doctor profiles in JSON format."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.1-8b-instant",
+                temperature=0.7,
+                max_tokens=512,
             )
             
-            if response.status_code != 200:
-                logger.error(f"Gemini API error: {response.status_code}")
-                return doctors
-            
-            result = response.json()
-            
-            # Extract text
-            result_text = ""
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    result_text = candidate['content']['parts'][0].get('text', '').strip()
+            result_text = response.choices[0].message.content.strip()
             
             # Clean JSON
             if '```json' in result_text:
@@ -768,17 +803,22 @@ Use common Indian doctor names. Keep hospital names realistic. Return only JSON,
 # MEDICAL OCR WITH GOOGLE VISION (REST API)
 # ================================
 
-# ================================
-# MEDICAL OCR WITH GOOGLE VISION (REST API)
-# ================================
-
 class MedicalReportOCR:
     def __init__(self):
-        self.api_key = Config.GOOGLE_VISION_API_KEY
-        self.vision_api_url = f"https://vision.googleapis.com/v1/images:annotate?key={self.api_key}"
-        self.gemini_api_key = Config.GEMINI_API_KEY
-        self.gemini_api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={self.gemini_api_key}"
-        logger.info("MedicalReportOCR initialized with Google Vision and Gemini REST API")
+        self.api_key = Config.AZURE_VISION_KEY
+        self.vision_api_url = f"{Config.AZURE_VISION_ENDPOINT.rstrip('/')}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read"
+        self.vision_ocr_url = f"{Config.AZURE_VISION_ENDPOINT.rstrip('/')}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read"
+        self.groq_client = None
+        self._init_components()
+    
+    def _init_components(self):
+        try:
+            self.groq_client = Groq(api_key=Config.GROQ_API_KEY)
+            logger.info("Components initialized with Google Vision API key")
+            
+        except Exception as e:
+            logger.error(f"Initialization error: {e}")
+            raise
     
     def convert_pdf_to_images(self, pdf_path: str) -> List[str]:
         """Convert PDF to images using PyMuPDF (no system dependencies)"""
@@ -812,138 +852,61 @@ class MedicalReportOCR:
             raise
     
     def extract_text(self, image_path: str, use_document_detection: bool = False) -> str:
-        """
-        Extract text using Google Vision REST API with API key
-        
-        Args:
-            image_path: Path to the image file
-            use_document_detection: If True, uses DOCUMENT_TEXT_DETECTION for handwritten text
-                                   If False, uses TEXT_DETECTION for regular reports
-        """
-        try:
-            # Read and encode image to base64
-            with open(image_path, 'rb') as image_file:
-                image_content = image_file.read()
-            
-            encoded_image = base64.b64encode(image_content).decode('utf-8')
-            
-            # Choose detection type based on parameter
-            detection_type = "DOCUMENT_TEXT_DETECTION" if use_document_detection else "TEXT_DETECTION"
-            
-            # Prepare the request payload
-            payload = {
-                "requests": [
-                    {
-                        "image": {
-                            "content": encoded_image
-                        },
-                        "features": [
-                            {
-                                "type": detection_type
-                            }
-                        ]
-                    }
-                ]
-            }
-            
-            # Make the API request
-            response = http_requests.post(
-                self.vision_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Vision API error: {response.status_code} - {response.text}")
-            
-            result = response.json()
-            
-            # Check for errors in response
-            if 'responses' in result and len(result['responses']) > 0:
-                response_data = result['responses'][0]
-                
-                if 'error' in response_data:
-                    raise Exception(f"Vision API error: {response_data['error']}")
-                
-                # For DOCUMENT_TEXT_DETECTION, use fullTextAnnotation
-                if use_document_detection and 'fullTextAnnotation' in response_data:
-                    full_text = response_data['fullTextAnnotation']['text']
-                    logger.info(f"Extracted {len(full_text)} characters using DOCUMENT_TEXT_DETECTION")
-                    return full_text
-                # For TEXT_DETECTION, use textAnnotations
-                elif 'textAnnotations' in response_data and len(response_data['textAnnotations']) > 0:
-                    full_text = response_data['textAnnotations'][0]['description']
-                    logger.info(f"Extracted {len(full_text)} characters using TEXT_DETECTION")
-                    return full_text
-                else:
-                    logger.warning("No text found in image")
-                    return ""
-            else:
-                return ""
-                
-        except Exception as e:
-            logger.error(f"Text extraction failed: {e}")
-            raise
+            """
+            Extract text using Azure Computer Vision Read API.
+            use_document_detection=True is kept for API compatibility but Azure
+            handles both printed and handwritten text automatically.
+            """
+            try:
+                with open(image_path, 'rb') as image_file:
+                    image_content = image_file.read()
+
+                headers = {
+                    'Ocp-Apim-Subscription-Key': self.api_key,
+                    'Content-Type': 'application/octet-stream'
+                }
+
+                url = f"{Config.AZURE_VISION_ENDPOINT.rstrip('/')}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read"
+
+                response = http_requests.post(url, headers=headers, data=image_content, timeout=30)
+
+                if response.status_code != 200:
+                    raise Exception(f"Azure Vision API error: {response.status_code} - {response.text}")
+
+                result = response.json()
+
+                # Extract text from Azure's response structure
+                read_result = result.get('readResult', {})
+                blocks = read_result.get('blocks', [])
+
+                lines_text = []
+                for block in blocks:
+                    for line in block.get('lines', []):
+                        lines_text.append(line.get('text', ''))
+
+                full_text = '\n'.join(lines_text)
+                mode = "handwriting" if use_document_detection else "print"
+                logger.info(f"Extracted {len(full_text)} characters via Azure Vision ({mode} mode)")
+                return full_text
+
+            except Exception as e:
+                logger.error(f"Text extraction failed: {e}")
+                raise
+       
     
-    def _fallback_test_extraction(self, text: str) -> List[Dict]:
-        """Fallback method to extract tests using pattern matching"""
-        test_results = []
-        
-        # Common patterns for test results
-        import re
-        
-        # Pattern 1: "Test Name : Value Unit Range"
-        pattern1 = r'([A-Za-z\s\(\)]+)\s*[:]\s*([0-9\.]+)\s*([a-zA-Z/%]+)?\s*(?:Ref|Reference)?[:\s]*([0-9\.\-\s]+)?'
-        
-        # Pattern 2: "Test Name  Value  Range"
-        pattern2 = r'([A-Za-z\s\(\)]{3,30})\s+([0-9\.]+)\s+([a-zA-Z/%]+)?\s+([0-9\.\-]+\s*-\s*[0-9\.]+)?'
-        
-        lines = text.split('\n')
-        
-        for line in lines:
-            # Try pattern 1
-            matches = re.finditer(pattern1, line)
-            for match in matches:
-                test_name = match.group(1).strip()
-                value = match.group(2).strip()
-                unit = match.group(3).strip() if match.group(3) else None
-                ref_range = match.group(4).strip() if match.group(4) else None
-                
-                # Filter out non-test lines
-                if len(test_name) > 2 and not any(x in test_name.lower() for x in ['hospital', 'patient', 'date', 'page', 'report']):
-                    test_results.append({
-                        'test_name': test_name,
-                        'result_value': value,
-                        'unit': unit,
-                        'reference_range': ref_range
-                    })
-        
-        logger.info(f"Fallback extraction found {len(test_results)} tests")
-        return test_results
-    
-    def generate_json_with_gemini(self, extracted_text: str, image_filename: str):
-        """Enhanced JSON generation with better prompting for Gemini"""
+    def generate_json_with_groq(self, extracted_text: str, image_filename: str):
         if not extracted_text or len(extracted_text.strip()) < 10:
             return {'success': False, 'error': 'Insufficient text extracted'}
         
-        max_length = 8000
+        max_length = 4000
         if len(extracted_text) > max_length:
             extracted_text = extracted_text[:max_length]
         
-        prompt = f"""You are a medical data extraction expert. Extract ALL test results from this medical report.
+        prompt = f"""Extract medical report information from this text and format as JSON:
 
-EXTRACTED TEXT:
-{extracted_text}
+TEXT: {extracted_text}
 
-INSTRUCTIONS:
-1. Extract EVERY test parameter you can find (e.g., Hemoglobin, Glucose, Cholesterol, WBC, RBC, Platelet Count, etc.)
-2. Extract the result values with their units
-3. Extract reference ranges if available
-4. If a field is not found, use null
-5. Return ONLY valid JSON, no markdown formatting, no explanation
-
-OUTPUT FORMAT:
+Return JSON with these fields (use null if not found):
 {{
   "hospital_info": {{
     "hospital_name": "string or null",
@@ -963,59 +926,29 @@ OUTPUT FORMAT:
   }},
   "test_results": [
     {{
-      "test_name": "Hemoglobin",
-      "result_value": "14.5",
-      "reference_range": "12-16",
-      "unit": "g/dL"
-    }},
-    {{
-      "test_name": "Total WBC Count",
-      "result_value": "8500",
-      "reference_range": "4000-11000",
-      "unit": "cells/cumm"
+      "test_name": "string",
+      "result_value": "string",
+      "reference_range": "string or null",
+      "unit": "string or null"
     }}
   ]
 }}
 
-CRITICAL: Extract ALL tests found in the report. The test_results array should contain every single test parameter mentioned. Return ONLY the JSON object, nothing else."""
+Return only valid JSON."""
 
         try:
-            # Use REST API
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 4096,  # Increased for more tests
-                }
-            }
-            
-            response = http_requests.post(
-                self.gemini_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
+            response = self.groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "Extract medical data and return valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.1-8b-instant",
+                temperature=0.1,
+                max_tokens=1024,
             )
             
-            if response.status_code != 200:
-                raise Exception(f"Gemini API error: {response.status_code} - {response.text}")
+            json_text = response.choices[0].message.content.strip()
             
-            result = response.json()
-            
-            # Extract text from response
-            json_text = ""
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    json_text = candidate['content']['parts'][0].get('text', '').strip()
-            
-            if not json_text:
-                raise Exception("Empty response from Gemini")
-            
-            # Clean JSON formatting
             if '```json' in json_text:
                 json_text = json_text.split('```json')[1].split('```')[0]
             elif '```' in json_text:
@@ -1023,52 +956,28 @@ CRITICAL: Extract ALL tests found in the report. The test_results array should c
             
             json_text = json_text.strip()
             
-            # Log for debugging
-            logger.info(f"Gemini returned JSON length: {len(json_text)}")
-            
             try:
                 parsed_json = json.loads(json_text)
-                
-                # Validate test_results
-                test_count = len(parsed_json.get('test_results', []))
-                logger.info(f"Parsed {test_count} test results from report")
-                
-                if test_count == 0:
-                    logger.warning("No test results found in Gemini response - trying fallback extraction")
-                    # Fallback: try to extract tests directly from text
-                    fallback_tests = self._fallback_test_extraction(extracted_text)
-                    if fallback_tests:
-                        parsed_json['test_results'] = fallback_tests
-                        logger.info(f"Fallback extraction added {len(fallback_tests)} tests")
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parse error: {e}")
-                logger.error(f"Problematic JSON: {json_text[:500]}")
-                # Create minimal structure with fallback extraction
+            except json.JSONDecodeError:
                 parsed_json = {
                     "hospital_info": {"hospital_name": None, "address": None},
                     "patient_info": {"name": None, "age": None, "gender": None},
                     "doctor_info": {"referring_doctor": None},
                     "report_info": {"report_type": "Medical Report", "report_date": None},
-                    "test_results": self._fallback_test_extraction(extracted_text)
+                    "test_results": []
                 }
             
             parsed_json['_metadata'] = {
                 'source_image': image_filename,
                 'extraction_method': 'google_vision_rest_api',
                 'processing_timestamp': datetime.now().isoformat(),
-                'model_used': 'gemini-2.0-flash-exp'
+                'model_used': 'llama-3.1-8b-instant'
             }
-            
-            final_test_count = len(parsed_json.get('test_results', []))
-            logger.info(f"Final JSON contains {final_test_count} test results")
             
             return {'success': True, 'json_data': parsed_json}
             
         except Exception as e:
-            logger.error(f"Gemini processing error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Groq processing error: {e}")
             return {'success': False, 'error': str(e)}
     
     def process_prescription(self, file_path: str):
@@ -1083,10 +992,8 @@ CRITICAL: Extract ALL tests found in the report. The test_results array should c
                     'error': 'No text found in prescription'
                 }
             
-            # Use Gemini to structure the prescription data
-            prompt = f"""You are a prescription extraction assistant. Extract prescription data. Never return null values. Use 'As directed' or 'Not specified' for missing fields.
-
-Extract prescription information from this handwritten text:
+            # Use Groq to structure the prescription data
+            prompt = f"""Extract prescription information from this handwritten text:
 
 TEXT: {extracted_text}
 
@@ -1107,39 +1014,19 @@ Return JSON with this format. IMPORTANT: Never use null values, always provide d
 }}
 
 CRITICAL: If a field is unclear, use 'As directed' or 'Not specified' instead of null.
-Return only valid JSON, no markdown formatting."""
+Return only valid JSON."""
 
-            # Use REST API
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 2048,
-                }
-            }
-            
-            response = http_requests.post(
-                self.gemini_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
+            response = self.groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "Extract prescription data. Never return null values. Use 'As directed' or 'Not specified' for missing fields."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.1-8b-instant",
+                temperature=0.1,
+                max_tokens=1024,
             )
             
-            if response.status_code != 200:
-                raise Exception(f"Gemini API error: {response.status_code}")
-            
-            result = response.json()
-            
-            # Extract text
-            json_text = ""
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    json_text = candidate['content']['parts'][0].get('text', '').strip()
+            json_text = response.choices[0].message.content.strip()
             
             # Clean JSON
             if '```json' in json_text:
@@ -1189,13 +1076,12 @@ Return only valid JSON, no markdown formatting."""
             }
     
     def process_image(self, file_path: str):
-        """Process regular medical report using TEXT_DETECTION with enhanced debugging"""
+        """Process regular medical report using TEXT_DETECTION"""
         image_filename = os.path.basename(file_path)
         
         try:
             # Check if file is PDF
             if file_path.lower().endswith('.pdf'):
-                logger.info(f"Processing PDF: {image_filename}")
                 # Convert PDF to images
                 image_paths = self.convert_pdf_to_images(file_path)
                 
@@ -1207,21 +1093,16 @@ Return only valid JSON, no markdown formatting."""
                     try:
                         # Use TEXT_DETECTION for regular reports
                         extracted_text = self.extract_text(img_path, use_document_detection=False)
-                        logger.info(f"Page extracted text length: {len(extracted_text)}")
-                        
                         if extracted_text.strip():
                             all_extracted_text.append(extracted_text)
                             
-                            gemini_result = self.generate_json_with_gemini(
+                            groq_result = self.generate_json_with_groq(
                                 extracted_text, 
                                 f"{image_filename}_page_{len(all_json_data)+1}"
                             )
                             
-                            if gemini_result['success']:
-                                json_data = gemini_result['json_data']
-                                test_count = len(json_data.get('test_results', []))
-                                logger.info(f"Page {len(all_json_data)+1}: Extracted {test_count} tests")
-                                all_json_data.append(json_data)
+                            if groq_result['success']:
+                                all_json_data.append(groq_result['json_data'])
                     finally:
                         # Clean up temporary image
                         if os.path.exists(img_path):
@@ -1246,9 +1127,6 @@ Return only valid JSON, no markdown formatting."""
                             json_data.get('test_results', [])
                         )
                 
-                total_tests = len(primary_json.get('test_results', []))
-                logger.info(f"PDF processing complete: {total_tests} total tests extracted")
-                
                 return {
                     'success': True,
                     'image_filename': image_filename,
@@ -1257,10 +1135,8 @@ Return only valid JSON, no markdown formatting."""
                 }
             
             else:
-                logger.info(f"Processing image: {image_filename}")
                 # Original image processing logic - use TEXT_DETECTION for regular reports
                 extracted_text = self.extract_text(file_path, use_document_detection=False)
-                logger.info(f"Extracted text length: {len(extracted_text)}")
                 
                 if not extracted_text.strip():
                     return {
@@ -1269,34 +1145,25 @@ Return only valid JSON, no markdown formatting."""
                         'image_filename': image_filename
                     }
                 
-                # Log sample of extracted text
-                logger.info(f"Text sample: {extracted_text[:200]}")
+                groq_result = self.generate_json_with_groq(extracted_text, image_filename)
                 
-                gemini_result = self.generate_json_with_gemini(extracted_text, image_filename)
-                
-                if gemini_result['success']:
-                    test_count = len(gemini_result['json_data'].get('test_results', []))
-                    logger.info(f"Successfully extracted {test_count} tests from image")
-                    
+                if groq_result['success']:
                     return {
                         'success': True,
                         'image_filename': image_filename,
                         'extracted_text': extracted_text,
-                        'structured_json': gemini_result['json_data']
+                        'structured_json': groq_result['json_data']
                     }
                 else:
-                    logger.error(f"JSON generation failed: {gemini_result.get('error')}")
                     return {
                         'success': False,
-                        'error': gemini_result['error'],
+                        'error': groq_result['error'],
                         'image_filename': image_filename,
                         'extracted_text': extracted_text[:500]
                     }
                     
         except Exception as e:
             logger.error(f"Processing error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return {
                 'success': False,
                 'error': str(e),
@@ -1309,10 +1176,10 @@ Return only valid JSON, no markdown formatting."""
 class RAGSystem:
     def __init__(self):
         self.client = None
-        self.vector_store = None
+        self.query_engine = None
         self.embed_model = None
-        self.gemini_api_key = None
-        self.gemini_api_url = None
+        self.llm = None
+        self.groq_client = None
         self._init_components()
     
     def _init_components(self):
@@ -1328,119 +1195,29 @@ class RAGSystem:
                 model_name=Config.EMBEDDING_MODEL
             )
             
-            # Store API key for REST API calls
-            self.gemini_api_key = Config.GEMINI_API_KEY
-            self.gemini_api_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={self.gemini_api_key}"
+            self.llm = GroqLLM(
+                model="llama-3.3-70b-versatile",
+                api_key=Config.GROQ_API_KEY,
+                temperature=0.1,
+                max_tokens=1024
+            )
             
-            # Set embedding model for LlamaIndex
+            self.groq_client = Groq(api_key=Config.GROQ_API_KEY)
+            
             Settings.embed_model = self.embed_model
+            Settings.llm = self.llm
             
-            logger.info("RAG system initialized with OpenRouter embeddings and Gemini REST API")
+            logger.info("RAG system initialized with OpenRouter embeddings")
             
         except Exception as e:
             logger.error(f"RAG initialization error: {e}")
-            raise
-    
-    def _retrieve_context(self, query: str, top_k: int = 10) -> str:
-        """Manually retrieve relevant context from Qdrant"""
-        try:
-            # Get query embedding
-            query_embedding = self.embed_model._get_query_embedding(query)
-            
-            # Search in Qdrant
-            search_results = self.client.search(
-                collection_name=Config.COLLECTION_NAME,
-                query_vector=query_embedding,
-                limit=top_k
-            )
-            
-            # Combine contexts
-            contexts = []
-            for result in search_results:
-                if hasattr(result, 'payload'):
-                    # Get document text - check different possible keys
-                    text_content = (
-                        result.payload.get('_node_content') or 
-                        result.payload.get('text') or 
-                        str(result.payload)
-                    )
-                    contexts.append(text_content)
-            
-            return "\n\n".join(contexts)
-            
-        except Exception as e:
-            logger.error(f"Context retrieval error: {e}")
-            return ""
-    
-    def _generate_response(self, query: str, context: str) -> str:
-        """Generate response using Gemini REST API with retrieved context"""
-        try:
-            prompt = f"""Context from medical reports:
----------------------
-{context}
----------------------
-
-Answer questions about the medical reports based on the context above.
-
-Instructions:
-1. For test results: Include test name, value, unit, reference range
-2. For abnormal values: Explain what it means and suggestions to improve
-3. For dietary questions: Provide specific foods to eat and avoid
-4. For lifestyle: Give practical recommendations (exercise, sleep, stress management)
-5. For report comments: Cite the exact comments mentioned in the report
-6. Be specific, practical, and evidence-based
-7. If information is unavailable, state clearly
-8. Use bullet points for clarity
-
-Question: {query}
-
-Answer:"""
-
-            # Use REST API instead of SDK
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 2048,
-                }
-            }
-            
-            response = http_requests.post(
-                self.gemini_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Gemini API error: {response.status_code} - {response.text}")
-            
-            result = response.json()
-            
-            # Extract text from response
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    text = candidate['content']['parts'][0].get('text', '')
-                    return text.strip()
-            
-            raise Exception("No response generated from Gemini")
-            
-        except Exception as e:
-            logger.error(f"Response generation error: {e}")
             raise
     
     def detect_abnormal_values(self, context: str) -> List[Dict]:
         abnormal_tests = []
         
         try:
-            prompt = f"""You are a medical analyst. Identify abnormal results.
-
-Analyze this medical data and identify abnormal test results:
+            prompt = f"""Analyze this medical data and identify abnormal test results:
 
 {context}
 
@@ -1454,48 +1231,22 @@ Return as JSON array:
   }}
 ]
 
-Only abnormal values. If none, return []. Return only valid JSON, no markdown formatting."""
+Only abnormal values. If none, return []."""
 
-            # Use REST API
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 1024,
-                }
-            }
-            
-            response = http_requests.post(
-                self.gemini_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
+            response = self.groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are a medical analyst. Identify abnormal results."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.1-8b-instant",
+                temperature=0.1,
+                max_tokens=512,
             )
             
-            if response.status_code != 200:
-                logger.error(f"Gemini API error: {response.status_code}")
-                return abnormal_tests
-            
-            result = response.json()
-            
-            # Extract text
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    result_text = candidate['content']['parts'][0].get('text', '').strip()
-                else:
-                    return abnormal_tests
-            else:
-                return abnormal_tests
+            result_text = response.choices[0].message.content.strip()
             
             if '```json' in result_text:
                 result_text = result_text.split('```json')[1].split('```')[0]
-            elif '```' in result_text:
-                result_text = result_text.split('```')[1].split('```')[0]
             
             try:
                 abnormal_data = json.loads(result_text.strip())
@@ -1624,6 +1375,7 @@ Only abnormal values. If none, return []. Return only valid JSON, no markdown fo
             )
             
             logger.info(f"Successfully indexed {len(documents)} documents")
+            self._init_query_engine()
             
             return True, f"Successfully indexed {len(documents)} reports"
             
@@ -1631,22 +1383,61 @@ Only abnormal values. If none, return []. Return only valid JSON, no markdown fo
             logger.error(f"Database setup error: {e}")
             return False, str(e)
     
-    def query(self, query_text: str, patient_name: Optional[str] = None):
-        """Query using manual retrieval + Gemini"""
+    def _init_query_engine(self):
         try:
-            # Enhance query with patient name if provided
+            vector_store = QdrantVectorStore(
+                client=self.client,
+                collection_name=Config.COLLECTION_NAME
+            )
+            
+            index = VectorStoreIndex.from_vector_store(
+                vector_store,
+                embed_model=self.embed_model
+            )
+            
+            template = """Context from medical reports:
+---------------------
+{context_str}
+---------------------
+
+Answer questions about the medical reports based on the context above.
+
+Instructions:
+1. For test results: Include test name, value, unit, reference range
+2. For abnormal values: Explain what it means and suggestions to improve
+3. For dietary questions: Provide specific foods to eat and avoid
+4. For lifestyle: Give practical recommendations (exercise, sleep, stress management)
+5. For report comments: Cite the exact comments mentioned in the report
+6. Be specific, practical, and evidence-based
+7. If information is unavailable, state clearly
+8. Use bullet points for clarity
+
+Question: {query_str}
+
+Answer:"""
+            
+            qa_prompt = PromptTemplate(template)
+            
+            # Query engine without reranking
+            self.query_engine = index.as_query_engine(
+                llm=self.llm,
+                similarity_top_k=10
+            )
+            self.query_engine.update_prompts({"response_synthesizer:text_qa_template": qa_prompt})
+            
+        except Exception as e:
+            logger.error(f"Query engine error: {e}")
+            raise
+    
+    def query(self, query_text: str, patient_name: Optional[str] = None):
+        try:
+            if self.query_engine is None:
+                self._init_query_engine()
+            
             enhanced_query = f"For patient {patient_name}: {query_text}" if patient_name else query_text
+            response = self.query_engine.query(enhanced_query)
             
-            # Retrieve context from Qdrant
-            context = self._retrieve_context(enhanced_query, top_k=10)
-            
-            if not context:
-                return "No relevant information found in the database.", patient_name
-            
-            # Generate response using Gemini
-            response = self._generate_response(enhanced_query, context)
-            
-            return response, patient_name
+            return str(response), patient_name
             
         except Exception as e:
             logger.error(f"Query error: {e}")
@@ -1656,9 +1447,7 @@ Only abnormal values. If none, return []. Return only valid JSON, no markdown fo
         try:
             context, detected_patient = self.query(query_text, patient_name)
             
-            prompt = f"""You are a medical report comparison assistant. Create clean comparison tables.
-
-Create a comparison table in markdown format:
+            prompt = f"""Create a comparison table in markdown format:
 
 Medical Data:
 {context}
@@ -1668,42 +1457,19 @@ Query: {query_text}
 Format:
 | Test Parameter | Report 1 (Date) | Report 2 (Date) |
 | --- | --- | --- |
-| Test Name | Value1 | Value2 |
+| Test Name | Value1 | Value2 |"""
 
-Return only the markdown table, no additional text."""
-
-            # Use REST API
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 2048,
-                }
-            }
-            
-            response = http_requests.post(
-                self.gemini_api_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=30
+            response = self.groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "Create clean comparison tables."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-3.3-70b-versatile",
+                temperature=0.1,
+                max_tokens=1024,
             )
             
-            if response.status_code != 200:
-                raise Exception(f"Gemini API error: {response.status_code}")
-            
-            result = response.json()
-            
-            # Extract text
-            table_text = ""
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    table_text = candidate['content']['parts'][0].get('text', '').strip()
-
+            table_text = response.choices[0].message.content.strip()
             table_data = self._parse_table(table_text)
             abnormal_tests = self.detect_abnormal_values(context)
             
@@ -1870,7 +1636,7 @@ Return only the markdown table, no additional text."""
             return []
     
     def get_report_by_id(self, report_id: str) -> Optional[Dict[str, Any]]:
-        """Get specific report data by ID with full test results"""
+        """Get specific report data by ID"""
         try:
             point = self.client.retrieve(
                 collection_name=Config.COLLECTION_NAME,
@@ -1882,52 +1648,13 @@ Return only the markdown table, no additional text."""
             
             payload = point[0].payload
             
-            # Parse the text content to extract test results
-            text_content = payload.get('_node_content') or payload.get('text') or str(payload)
-            
-            # Extract test results from the stored text
-            test_results = []
-            lines = text_content.split('\n')
-            
-            for line in lines:
-                if line.startswith('Test:'):
-                    # Parse test line: "Test: TestName Result: Value Reference: Range"
-                    parts = line.replace('Test:', '').strip()
-                    
-                    test_dict = {}
-                    
-                    # Extract test name
-                    if 'Result:' in parts:
-                        test_name = parts.split('Result:')[0].strip()
-                        test_dict['test_name'] = test_name
-                        
-                        # Extract result value
-                        remaining = parts.split('Result:')[1]
-                        if 'Reference:' in remaining:
-                            result_value = remaining.split('Reference:')[0].strip()
-                            test_dict['result_value'] = result_value
-                            
-                            # Extract reference range
-                            reference_range = remaining.split('Reference:')[1].strip()
-                            test_dict['reference_range'] = reference_range
-                        else:
-                            test_dict['result_value'] = remaining.strip()
-                            test_dict['reference_range'] = None
-                    else:
-                        test_dict['test_name'] = parts
-                        test_dict['result_value'] = None
-                        test_dict['reference_range'] = None
-                    
-                    test_dict['unit'] = None
-                    test_results.append(test_dict)
-            
+            # Parse test results from the stored text
             return {
                 'patient_name': payload.get('patient_name', 'Unknown'),
                 'hospital_name': payload.get('hospital_name', 'Unknown'),
                 'report_type': payload.get('report_type', 'Medical Report'),
                 'report_date': payload.get('report_date', 'Unknown'),
-                'source_image': payload.get('source_image', 'Unknown'),
-                'test_results': test_results  # Include parsed test results
+                'source_image': payload.get('source_image', 'Unknown')
             }
             
         except Exception as e:
@@ -1941,68 +1668,17 @@ Return only the markdown table, no additional text."""
             tests1 = report1_data.get('test_results', [])
             tests2 = report2_data.get('test_results', [])
             
-            logger.info(f"Report 1 has {len(tests1)} tests")
-            logger.info(f"Report 2 has {len(tests2)} tests")
-            
-            if not tests1 or not tests2:
-                return {
-                    'success': False,
-                    'error': f'Insufficient test data. Report 1: {len(tests1)} tests, Report 2: {len(tests2)} tests'
-                }
-            
-            # Create mapping of test names to results (case-insensitive, normalized)
-            def normalize_test_name(name):
-                """Normalize test names for better matching"""
-                if not name:
-                    return ""
-                # Convert to lowercase and remove extra spaces
-                normalized = name.lower().strip()
-                # Remove common variations
-                normalized = normalized.replace('serum', '').replace('blood', '').strip()
-                return normalized
-            
-            tests1_map = {}
-            for test in tests1:
-                if isinstance(test, dict) and test.get('test_name'):
-                    key = normalize_test_name(test['test_name'])
-                    tests1_map[key] = test
-            
-            tests2_map = {}
-            for test in tests2:
-                if isinstance(test, dict) and test.get('test_name'):
-                    key = normalize_test_name(test['test_name'])
-                    tests2_map[key] = test
-            
-            logger.info(f"Normalized test names - Report 1: {list(tests1_map.keys())}")
-            logger.info(f"Normalized test names - Report 2: {list(tests2_map.keys())}")
+            # Create mapping of test names to results
+            tests1_map = {test['test_name'].lower().strip(): test for test in tests1 if isinstance(test, dict)}
+            tests2_map = {test['test_name'].lower().strip(): test for test in tests2 if isinstance(test, dict)}
             
             # Find common tests
             common_tests = set(tests1_map.keys()) & set(tests2_map.keys())
             
-            logger.info(f"Common tests found: {len(common_tests)} - {list(common_tests)}")
-            
-            if not common_tests:
-                # If no exact matches, try fuzzy matching
-                common_tests = set()
-                for key1 in tests1_map.keys():
-                    for key2 in tests2_map.keys():
-                        # Check if one is substring of another or vice versa
-                        if (key1 in key2 or key2 in key1) and len(key1) > 3:
-                            # Use the longer key as canonical
-                            canonical_key = key1 if len(key1) >= len(key2) else key2
-                            common_tests.add(canonical_key)
-                            # Map both to the same canonical key
-                            if canonical_key not in tests1_map:
-                                tests1_map[canonical_key] = tests1_map[key1]
-                            if canonical_key not in tests2_map:
-                                tests2_map[canonical_key] = tests2_map[key2]
-                
-                logger.info(f"After fuzzy matching: {len(common_tests)} common tests")
-            
             if not common_tests:
                 return {
                     'success': False,
-                    'error': f'No common tests found. Report 1 tests: {", ".join(list(tests1_map.keys())[:5])}. Report 2 tests: {", ".join(list(tests2_map.keys())[:5])}'
+                    'error': 'No common tests found between the two reports'
                 }
             
             # Build comparison table
@@ -2020,41 +1696,32 @@ Return only the markdown table, no additional text."""
                 test1 = tests1_map[test_name_key]
                 test2 = tests2_map[test_name_key]
                 
-                # Use the original test name (not normalized) for display
-                display_name = test1.get('test_name', test_name_key)
-                
                 # Calculate change if both values are numeric
                 change = 'N/A'
                 try:
                     val1_str = str(test1.get('result_value', '')).strip()
                     val2_str = str(test2.get('result_value', '')).strip()
                     
-                    # Extract first number from the string
-                    val1_num = ''.join(filter(lambda x: x.isdigit() or x == '.' or x == '-', val1_str.split()[0]))
-                    val2_num = ''.join(filter(lambda x: x.isdigit() or x == '.' or x == '-', val2_str.split()[0]))
+                    val1 = float(''.join(filter(lambda x: x.isdigit() or x == '.', val1_str.split()[0])))
+                    val2 = float(''.join(filter(lambda x: x.isdigit() or x == '.', val2_str.split()[0])))
                     
-                    if val1_num and val2_num:
-                        val1 = float(val1_num)
-                        val2 = float(val2_num)
-                        
-                        diff = val2 - val1
-                        percent = (diff / val1 * 100) if val1 != 0 else 0
-                        
-                        if diff > 0:
-                            change = f"↑ {abs(diff):.2f} (+{percent:.1f}%)"
-                        elif diff < 0:
-                            change = f"↓ {abs(diff):.2f} ({percent:.1f}%)"
-                        else:
-                            change = "No change"
-                except Exception as e:
-                    logger.warning(f"Could not calculate change for {display_name}: {e}")
+                    diff = val2 - val1
+                    percent = (diff / val1 * 100) if val1 != 0 else 0
+                    
+                    if diff > 0:
+                        change = f"↑ {abs(diff):.2f} (+{percent:.1f}%)"
+                    elif diff < 0:
+                        change = f"↓ {abs(diff):.2f} ({percent:.1f}%)"
+                    else:
+                        change = "No change"
+                except:
                     pass
                 
                 rows.append([
-                    display_name,
-                    f"{test1.get('result_value', 'N/A')} {test1.get('unit', '') or ''}".strip(),
-                    f"{test2.get('result_value', 'N/A')} {test2.get('unit', '') or ''}".strip(),
-                    test1.get('reference_range') or test2.get('reference_range', 'N/A'),
+                    test1.get('test_name', test_name_key),
+                    f"{test1.get('result_value', 'N/A')} {test1.get('unit', '')}".strip(),
+                    f"{test2.get('result_value', 'N/A')} {test2.get('unit', '')}".strip(),
+                    test1.get('reference_range', test2.get('reference_range', 'N/A')),
                     change
                 ])
             
@@ -2080,8 +1747,6 @@ Return only the markdown table, no additional text."""
             
         except Exception as e:
             logger.error(f"Comparison error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return {
                 'success': False,
                 'error': str(e)
@@ -2325,14 +1990,11 @@ async def compare_reports(
         # Process Report 1
         if report1_id:
             # Get from database
-            logger.info(f"Fetching Report 1 from database with ID: {report1_id}")
             report1_data = rag_system.get_report_by_id(report1_id)
             if not report1_data:
                 raise HTTPException(status_code=404, detail="Report 1 not found in database")
-            logger.info(f"Report 1 loaded: {report1_data.get('patient_name')}, {len(report1_data.get('test_results', []))} tests")
         elif report1_file:
             # Process uploaded file
-            logger.info(f"Processing uploaded Report 1: {report1_file.filename}")
             temp_path = None
             try:
                 file_suffix = '.pdf' if report1_file.content_type == 'application/pdf' else '.jpg'
@@ -2343,18 +2005,13 @@ async def compare_reports(
                 
                 result = ocr_processor.process_image(temp_path)
                 if result['success']:
-                    json_data = result['structured_json']
-                    report1_data = {
-                        'patient_name': json_data.get('patient_info', {}).get('name', 'Unknown'),
-                        'report_date': json_data.get('report_info', {}).get('report_date', 'N/A'),
-                        'hospital_name': json_data.get('hospital_info', {}).get('hospital_name', 'Unknown'),
-                        'test_results': json_data.get('test_results', [])
-                    }
-                    logger.info(f"Report 1 processed: {report1_data.get('patient_name')}, {len(report1_data.get('test_results', []))} tests")
+                    report1_data = result['structured_json']
+                    report1_data['report_date'] = report1_data.get('report_info', {}).get('report_date', 'N/A')
+                    report1_data['patient_name'] = report1_data.get('patient_info', {}).get('name', 'Unknown')
+                    report1_data['hospital_name'] = report1_data.get('hospital_info', {}).get('hospital_name', 'Unknown')
                 else:
                     raise HTTPException(status_code=400, detail=f"Failed to process Report 1: {result.get('error')}")
             except Exception as e:
-                logger.error(f"Error processing Report 1: {e}")
                 raise HTTPException(status_code=500, detail=f"Error processing Report 1: {str(e)}")
         else:
             raise HTTPException(status_code=400, detail="Report 1 file or ID required")
@@ -2362,14 +2019,11 @@ async def compare_reports(
         # Process Report 2
         if report2_id:
             # Get from database
-            logger.info(f"Fetching Report 2 from database with ID: {report2_id}")
             report2_data = rag_system.get_report_by_id(report2_id)
             if not report2_data:
                 raise HTTPException(status_code=404, detail="Report 2 not found in database")
-            logger.info(f"Report 2 loaded: {report2_data.get('patient_name')}, {len(report2_data.get('test_results', []))} tests")
         elif report2_file:
             # Process uploaded file
-            logger.info(f"Processing uploaded Report 2: {report2_file.filename}")
             temp_path = None
             try:
                 file_suffix = '.pdf' if report2_file.content_type == 'application/pdf' else '.jpg'
@@ -2380,24 +2034,18 @@ async def compare_reports(
                 
                 result = ocr_processor.process_image(temp_path)
                 if result['success']:
-                    json_data = result['structured_json']
-                    report2_data = {
-                        'patient_name': json_data.get('patient_info', {}).get('name', 'Unknown'),
-                        'report_date': json_data.get('report_info', {}).get('report_date', 'N/A'),
-                        'hospital_name': json_data.get('hospital_info', {}).get('hospital_name', 'Unknown'),
-                        'test_results': json_data.get('test_results', [])
-                    }
-                    logger.info(f"Report 2 processed: {report2_data.get('patient_name')}, {len(report2_data.get('test_results', []))} tests")
+                    report2_data = result['structured_json']
+                    report2_data['report_date'] = report2_data.get('report_info', {}).get('report_date', 'N/A')
+                    report2_data['patient_name'] = report2_data.get('patient_info', {}).get('name', 'Unknown')
+                    report2_data['hospital_name'] = report2_data.get('hospital_info', {}).get('hospital_name', 'Unknown')
                 else:
                     raise HTTPException(status_code=400, detail=f"Failed to process Report 2: {result.get('error')}")
             except Exception as e:
-                logger.error(f"Error processing Report 2: {e}")
                 raise HTTPException(status_code=500, detail=f"Error processing Report 2: {str(e)}")
         else:
             raise HTTPException(status_code=400, detail="Report 2 file or ID required")
         
         # Compare reports
-        logger.info("Comparing reports...")
         comparison_result = rag_system.compare_two_reports(report1_data, report2_data)
         
         # Cleanup temporary files
@@ -2405,16 +2053,227 @@ async def compare_reports(
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
         
-        logger.info(f"Comparison result: {comparison_result.get('success')}")
         return comparison_result
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Compare reports error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for temp_path in temp_paths:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+# =============================================================================
+# VIDEO CONSULTATION SIGNALING ENDPOINTS  (v5.1 — with end-call sync)
+# =============================================================================
+
+@app.post("/api/video/room", response_model=VideoRoomResponse)
+async def create_video_room(body: VideoRoomCreate):
+    """Doctor calls this to create a room."""
+    _cleanup_old_rooms()
+
+    room_id = _gen_room_id()
+    while room_id in video_rooms:
+        room_id = _gen_room_id()
+
+    video_rooms[room_id] = {
+        "created":            datetime.now().isoformat(),
+        "doctor_joined":      body.role == 'doctor',
+        "patient_joined":     body.role == 'patient',
+        "offer":              None,
+        "answer":             None,
+        "doctor_candidates":  [],
+        "patient_candidates": [],
+        "last_activity":      datetime.now().isoformat(),
+        "call_ended":         False,   # ← NEW
+    }
+
+    logger.info(f"Video room created: {room_id} by {body.role}")
+    return VideoRoomResponse(success=True, room_id=room_id, message="Room created successfully")
+
+
+@app.get("/api/video/room/{room_id}")
+async def get_video_room(room_id: str):
+    """
+    Both sides poll this to get current room state.
+    Now also exposes call_ended flag so the other side knows to hang up.
+    """
+    room = video_rooms.get(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or expired")
+
+    return {
+        "success":            True,
+        "room_id":            room_id,
+        "doctor_joined":      room["doctor_joined"],
+        "patient_joined":     room["patient_joined"],
+        "offer":              room["offer"],
+        "answer":             room["answer"],
+        "doctor_candidates":  room["doctor_candidates"],
+        "patient_candidates": room["patient_candidates"],
+        "last_activity":      room["last_activity"],
+        "call_ended":         room["call_ended"],   # ← NEW
+    }
+
+
+@app.post("/api/video/room/{room_id}/join")
+async def join_video_room(room_id: str, body: VideoRoomCreate):
+    """Patient calls this to announce joining."""
+    room = video_rooms.get(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or expired")
+
+    if body.role == 'doctor':
+        room["doctor_joined"] = True
+    else:
+        room["patient_joined"] = True
+
+    room["last_activity"] = datetime.now().isoformat()
+    logger.info(f"Room {room_id}: {body.role} joined")
+    return {"success": True, "message": f"{body.role} joined the room"}
+
+
+@app.post("/api/video/room/{room_id}/signal")
+async def signal_video_room(room_id: str, payload: VideoSignalPayload):
+    """WebRTC signaling: offer / answer / candidate."""
+    room = video_rooms.get(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or expired")
+
+    if payload.type == 'offer':
+        room['offer'] = payload.data
+        logger.info(f"Room {room_id}: offer received from {payload.sender}")
+
+    elif payload.type == 'answer':
+        room['answer'] = payload.data
+        logger.info(f"Room {room_id}: answer received from {payload.sender}")
+
+    elif payload.type == 'candidate':
+        key = 'doctor_candidates' if payload.sender == 'doctor' else 'patient_candidates'
+        room[key].append(payload.data)
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown signal type: {payload.type}")
+
+    room['last_activity'] = datetime.now().isoformat()
+    return {"success": True}
+
+
+# ── NEW in v5.1 ───────────────────────────────────────────────────────────────
+
+@app.post("/api/video/room/{room_id}/end")
+async def end_video_call(room_id: str):
+    """
+    Either participant calls this when clicking 'End call'.
+    Sets call_ended = True so the other side's polling loop detects it
+    and also hangs up. This is the backend fallback alongside the
+    DataChannel 'end_call' message.
+    """
+    room = video_rooms.get(room_id)
+    if not room:
+        # Room already deleted — that's fine, nothing to do
+        return {"success": True, "message": "Room not found (already closed)"}
+
+    room["call_ended"]     = True
+    room["last_activity"]  = datetime.now().isoformat()
+    logger.info(f"Room {room_id}: call_ended flag set")
+    return {"success": True, "message": "Call ended — other participant will be notified on next poll"}
+
+
+@app.delete("/api/video/room/{room_id}")
+async def close_video_room(room_id: str):
+    """Either participant calls this after ending to clean up."""
+    if room_id in video_rooms:
+        del video_rooms[room_id]
+        logger.info(f"Video room {room_id} closed and removed")
+    return {"success": True, "message": "Room closed"}
+
+
+@app.get("/api/video/rooms")
+async def list_video_rooms():
+    """Debug endpoint — lists all active rooms."""
+    _cleanup_old_rooms()
+    return {
+        "active_rooms": [
+            {
+                "room_id":        rid,
+                "doctor_joined":  room["doctor_joined"],
+                "patient_joined": room["patient_joined"],
+                "has_offer":      room["offer"] is not None,
+                "has_answer":     room["answer"] is not None,
+                "call_ended":     room["call_ended"],
+                "created":        room["created"],
+            }
+            for rid, room in video_rooms.items()
+        ],
+        "count": len(video_rooms),
+    }
+@app.post("/api/video/room/{room_id}/share-file")
+async def share_file_in_room(
+    room_id: str,
+    sender: str,          # 'doctor' or 'patient'  — passed as a query param
+    file: UploadFile = File(...)
+):
+    """
+    Upload a file (PDF / image) during an active video call.
+    Returns a file_id the frontend uses to build the download URL.
+    """
+    room = video_rooms.get(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    allowed_types = {
+        "application/pdf",
+        "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"
+    }
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only PDF and image files are supported")
+
+    MAX_SIZE = 10 * 1024 * 1024   # 10 MB
+    data = await file.read()
+    if len(data) > MAX_SIZE:
+        raise HTTPException(status_code=400, detail="File too large (max 10 MB)")
+
+    file_id = str(uuid.uuid4())
+    shared_files[file_id] = {
+        "filename":     file.filename,
+        "content_type": file.content_type,
+        "data":         data,
+        "uploaded_by":  sender,
+        "room_id":      room_id,
+        "timestamp":    datetime.now().isoformat(),
+    }
+
+    logger.info(f"Room {room_id}: {sender} shared file '{file.filename}' ({len(data)} bytes) → {file_id}")
+    return {
+        "success":  True,
+        "file_id":  file_id,
+        "filename": file.filename,
+        "size":     len(data),
+    }
+
+
+@app.get("/api/video/file/{file_id}")
+async def download_shared_file(file_id: str):
+    """Serve a previously uploaded shared file by its file_id."""
+    from fastapi.responses import Response
+
+    entry = shared_files.get(file_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="File not found or expired")
+
+    return Response(
+        content=entry["data"],
+        media_type=entry["content_type"],
+        headers={
+            "Content-Disposition": f'inline; filename="{entry["filename"]}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 
 if __name__ == "__main__":
     import uvicorn
