@@ -10,15 +10,15 @@ python-dotenv
 # HTTP Requests
 requests
 
-# Google Generative AI
-google-generativeai
+# Groq LLM
+groq
+llama-index-llms-groq
 
 # Vector Database - Qdrant
 qdrant-client
 
 # LlamaIndex Core
 llama-index-core
-llama-index-llms-gemini
 llama-index-vector-stores-qdrant
 
 # Web Scraping
