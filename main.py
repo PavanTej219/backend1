@@ -25,7 +25,7 @@ from pathlib import Path
 
 load_dotenv()
 
-# Google Cloud Vision - Using REST API
+# Azure Cloud Vision - Using REST API
 import requests as http_requests
 
 # Core imports
@@ -41,7 +41,7 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.settings import Settings
 from llama_index.llms.groq import Groq as GroqLLM
-from llama_index.llms.gemini import Gemini as GeminiLLM
+# from llama_index.llms.gemini import Gemini as GeminiLLM
 from llama_index.core.embeddings import BaseEmbedding
 
 # Web scraping
